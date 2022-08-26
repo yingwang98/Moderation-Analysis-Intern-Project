@@ -1,0 +1,593 @@
+---
+title: "Moderation Analysis"
+author: "Ying Wang"
+date: "2022-08-20"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Environment setup
+Note: key may subject to change for everyone.
+Does not have MRRC scores analysis in this file. Waiting for retrainning.
+```{r}
+options(java.parameters = c("-XX:+UseConcMarkSweepGC", "-Xmx8192m"))
+gc()
+key=keyring::key_get("qubole")
+library(RJDBC)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+
+driver <- JDBC("com.qubole.jdbc.jdbc41.core.QDriver", "~/Downloads/R/qds-jdbc-3.0.3.jar", identifier.quote="`")
+presto <- dbConnect(driver,paste0("jdbc:qubole://presto/Presto?endpoint=https://us.qubole.com;password=",keyring::key_get("qubole")))
+
+```
+
+
+## Efficiency
+
+### Query
+The data we use is from 2022-01-01 to 2022-06-30.
+
+
+#### rev --- votes detail
+`rev` contains every vote from every moderator.
+```{r}
+rev=dbGetQuery(presto,"SELECT
+    user_profile_sk
+    ,content_id
+    ,review_status
+  FROM
+    p_dwh_moderation.reported_content_logs
+  WHERE
+    event_type = 'REVIEW' and ds>='2022-01-01' and ds <'2022-06-30'")
+```
+```{r}
+head(rev)
+```
+
+#### Active Moderator Geographic Data
+There might be some unmatch from individual geographic info to the other geo info.
+We query the neighborhood_id for each moderator and then join by `nd_city` to get city name, state, etc.
+```{r Active Moderator Geographic Data}
+geo=dbGetQuery(presto,"WITH moderator AS (
+  SELECT
+      role.user_profile_sk AS user_profile_sk
+      ,MIN( last.last_dau_platform_date ) AS last_dau
+      ,DATE (
+        MIN( role.role_start_datetime )
+      ) AS start_date
+    FROM
+      p_dwh_user_roles.role_status_by_day role LEFT JOIN p_dwh_general.member_last_active LAST
+        ON role.user_profile_sk = last.user_profile_sk
+    WHERE
+      role.role IN (
+        'community_reviewer'
+        ,'lead'
+      )
+      AND role.ds >= '2022-01-01'
+      AND last.last_dau_platform_date >= '2022-01-01'
+    GROUP BY
+      1
+) 
+
+select m.user_profile_sk,g.neighborhood_id, g.postal_code, g.city,g.county_name, g.state, g.country from
+moderator m LEFT join p_dwh_general.user_geo g
+on m.user_profile_sk = g.user_profile_sk")
+
+nd_city=dbGetQuery(presto,"select neighborhood_id, city, state,country,dma_name from p_dwh_general.neighborhood_detail")
+
+geo=geo%>%select(1,2)%>%left_join(nd_city)
+```
+
+#### Moderator Weekly Votes (`amv`)
+This query gives the weekly number of vote and report from every moderator.
+```{r}
+#Active Moderator Votes
+ecdf_df=function(vec,dt,name){
+  ec=ecdf(dt)
+  df=data.frame(vec,prop=ec(vec))
+  colnames(df)[1]=name
+  return(df)
+}
+
+amv= dbGetQuery(presto,"select user_profile_sk, date_diff (
+      'day'
+      ,date('2022-01-01')
+      ,date(ds)
+    ) / 7 AS time_n_22,
+	event_type,
+	 count(event_type)
+	 
+from p_dwh_moderation.reported_content_logs
+where ds>='2022-01-01' and ds< '2022-06-30'
+group by 1, 3,2
+order by 1, 3,2")
+
+```
+
+#### Active Moderator Weekly Session Count (`ams`)
+
+It seems the table `p_dwh_activity.session_agg_utc` is not available any more
+```{r} 
+# 
+# ams= dbGetQuery(presto,"WITH moderator AS (
+#   SELECT
+#       role.user_profile_sk AS user_profile_sk
+#       ,MIN( last.last_dau_platform_date ) AS last_dau
+#       ,DATE (
+#         MIN( role.role_start_datetime )
+#       ) AS start_date
+#     FROM
+#       p_dwh_user_roles.role_status_by_day role LEFT JOIN p_dwh_general.member_last_active LAST
+#         ON role.user_profile_sk = last.user_profile_sk
+#     WHERE
+#       role.role IN (
+#         'community_reviewer'
+#         ,'lead'
+#       )
+#       AND role.ds >= '2022-01-01'
+#       AND last.last_dau_platform_date >= '2022-01-01'
+#     GROUP BY
+#       1
+# ) SELECT
+#     m.user_profile_sk
+#     ,m.last_dau
+#     ,m.start_date
+#     ,date_diff (
+#       'day'
+#       ,DATE ('2022-01-01')
+#       ,DATE (s.ds)
+#     ) / 7 AS time_n_22
+#     ,count (s.session_event_id) AS weekly_sessions_count
+#   FROM
+#     moderator m LEFT JOIN p_dwh_activity.session_agg_utc s
+#       ON m.user_profile_sk = s.user_profile_sk
+# 	WHERE s.ds>='2022-01-01'
+#   GROUP BY
+#     1
+#     ,2
+#     ,3
+#     ,4
+# 
+#   ORDER BY
+#     1
+#     ,4
+# ")
+# 
+
+```
+
+#### Results and reasons
+```{r}
+reason_t= dbGetQuery(presto,"select * from p_dwh_constants.content_report_reason_constants")
+reasons= dbGetQuery(presto,"SELECT
+    content_id
+    ,source_neighborhood_id as neighborhood_id
+    ,content_type
+    ,report_cnt
+    ,report_reasons
+	,review_cnt
+	,review_remove_cnt as remove_cnt
+	,review_consider_removing_cnt as c_remove_cnt
+	,review_dont_remove_cnt as dont_cnt
+	,moderation_removed_ind as removal
+	,moderation_keep_ind as keep
+	,date_diff('minute',first_report_datetime,last_review_datetime) as process_time
+  FROM
+    p_dwh_moderation.reported_content_detail 
+	where date_format(content_creation_datetime,'%Y-%m-%d') >= '2022-01-01' 
+	and date_format(content_creation_datetime,'%Y-%m-%d') < '2022-06-30'")
+```
+
+### Analysis
+#### Preprocess
+`amvt` holds just the weekly number of votes from every moderator. `time_n_22` is the number of weeks from 01-01.
+```{r}
+colnames(amv)[4]='count'
+amv=amv%>%mutate(time_n_22=as.integer(time_n_22),
+                 count=as.integer(count))
+
+# ams=ams%>%mutate(time_n_22=as.integer(time_n_22),
+#                  weekly_sessions_count=as.integer(weekly_sessions_count))
+
+amvt=amv%>%filter(event_type=="REVIEW")%>%group_by(user_profile_sk,time_n_22)%>%summarise(count=sum(count))
+```
+
+Restrict the scale to be just US
+```{r}
+geo=geo%>%filter(country=="US")
+amvt=geo%>%select(user_profile_sk)%>%inner_join(amvt)
+# ams=geo%>%select(user_profile_sk)%>%inner_join(ams)
+```
+
+
+#### How many Moderators do we have?
+```{r}
+n_distinct(geo$user_profile_sk)
+```
+418679 moderators logged in to the platform at least once this Year.
+
+```{r}
+n_distinct(amvt$user_profile_sk)
+156757/413803
+```
+156757 voted at least once. 37.9% of the ones who logged in.
+
+
+```{r}
+votes_total=amvt%>%group_by(user_profile_sk)%>%summarise(votes=sum(count))
+```
+
+
+#### Votes number distribution
+prop = proportion of moderators voted less or equal to N votes.
+This table shows the percentage of moderators who voted n times or less.
+```{r}
+ecdf_df(c(1,5,10,15,30,45,60,75,100,150,200,250,350,500),votes_total$votes,"votes")%>%mutate(prop=prop%>%round(3)*100)
+```
+
+Rank moderators by the number of votes they voted.
+`cum_per` is (the cumulative sum of the votes by the first N moderators / all votes)
+```{r}
+votes_ranked=votes_total%>%arrange(desc(votes))%>%mutate(cum_per=cumsum(votes)/sum(votes))
+votes_ranked%>%mutate(rank=1:length(votes))%>%mutate(first10=(rank<=16000))%>%group_by(first10)%>%summarise(votes=sum(votes))
+votes_ranked
+```
+
+Check the cumulative proportion of votes by first 16000, 32000, 48000 moderators. (First 10% 20% 30%)
+```{r}
+#Check the cum
+votes_ranked%>%mutate(rank=1:length(votes),cum_per=cum_per%>%round(3)*100)%>%
+  slice(16000,32000,48000,53000,72000)%>%
+  rename()
+```
+
+
+#### results count and votes required
+```{r distribution of results}
+reasons=reasons%>%filter(!is.na(report_reasons))%>%
+  left_join(nd_city)%>%
+  filter(!(removal==1&keep==1),country=="US")%>%
+  mutate(points=3*remove_cnt+c_remove_cnt-3*dont_cnt)%>%
+  mutate(result=case_when(removal==1 | points>=9~"REMOVAL",
+                                  keep==1 | points <=(-9)~"KEEP",
+                                  review_cnt<=4~"NO_DECISION_4_OR_LESS",
+                                  TRUE~"NO_DECISION_5_OR_MORE"))%>%
+  mutate(process_time=as.integer(process_time)/60)
+
+reasons%>%count(result)%>%mutate(prop=(n/sum(n)*100)%>%round(1))%>%arrange(c(4,1,2,3))
+```
+
+
+
+```{r}
+reasons%>%count(result)%>%filter(result!="NO_DECISION_4_OR_LESS")%>%mutate(prop=(n/sum(n)*100)%>%round(1))
+```
+`reasons2` filter out abnormal posts
+```{r votes taken by result}
+reasons2=reasons%>%
+  filter(points<=12 & points>=(-12))
+
+keep_votes=reasons2%>%
+  count(result,review_cnt)%>%
+  group_by(result)%>%
+  mutate(prop=(n/sum(n)*100)%>%round(1))%>%
+  mutate(cum_prop=cumsum(prop))%>%
+  filter(review_cnt%in%c(0:15,20),result=="KEEP")%>%
+  rename(votes=review_cnt)
+
+removal_votes=reasons2%>%
+  count(result,review_cnt)%>%
+  group_by(result)%>%
+  mutate(prop=(n/sum(n)*100)%>%round(1))%>%
+  mutate(cum_prop=cumsum(prop))%>%
+  filter(review_cnt%in%c(0:15,20),result=="REMOVAL")%>%
+  rename(votes=review_cnt)
+
+no_decision_votes=reasons2%>%
+  count(result,review_cnt)%>%
+  filter(result%in%c("NO_DECISION_4_OR_LESS","NO_DECISION_5_OR_MORE"))%>%
+  mutate(prop=(n/sum(n)*100)%>%round(1))%>%
+  mutate(cum_prop=cumsum(prop))%>%
+  filter(review_cnt%in%c(0:15,20))%>%
+  rename(votes=review_cnt)
+
+keep_votes
+removal_votes
+no_decision_votes
+```
+
+
+There are some abnormal rows: points go beyond 9/-9. I wonder if the resolved posts be removed from the queues of moderators who haven't voted on it.
+
+example: content_id=225887517
+  3 more votes after the decision made for REMOVAL
+  
+Don't know how often this is. 78,117 posts points>=12. 6% of all removed, not too bad.
+
+```{r abnormal posts}
+reasons%>%filter(points<=(-12))
+reasons%>%filter(points>=(12))
+```
+
+#### Removal Time
+```{r Removal Time Table}
+reasons%>%
+  filter(result=="REMOVAL",process_time<24*30)%>%
+  summarise(average_time=mean(process_time,na.rm=T),
+  median_time=median(process_time,na.rm=T),
+  perc_75=quantile(process_time,.75,na.rm=T),
+  perc_90=quantile(process_time,.90,na.rm=T))
+```
+
+
+```{r}
+ecdf_df(c(1,6,12,18,24,36,48,12*7,12*15),votes_removal$process_time,"removal_time")
+```
+
+
+### dma Efficiency
+```{r dma Removal Time Table}
+dma_time=reasons%>%
+  filter(result=="REMOVAL",process_time<24*30)%>%
+  group_by(dma_name)%>%
+  summarise(average_time=mean(process_time,na.rm=T),
+  median_time=median(process_time,na.rm=T),
+  perc_75=quantile(process_time,.75,na.rm=T),
+  perc_90=quantile(process_time,.90,na.rm=T))
+
+dma_result=reasons%>%
+  group_by(dma_name)%>%
+  count(result)%>%
+  pivot_wider(names_from=result,values_from = n)
+
+dma_efficiency=reasons%>%
+  count(dma_name)%>%
+  arrange(desc(n))%>%
+  rename(reported=n)%>%
+  left_join(dma_result)%>%
+  left_join(dma_time)%>%
+  mutate(under_voted_prop=NO_DECISION_4_OR_LESS/reported,
+         potential_efficiency_gain=NO_DECISION_4_OR_LESS*0.7)%>%
+  mutate(report_bins=cut(reported,c(0,200,500,1000,5000,10000,Inf)),
+         under_v_bins=cut(under_voted_prop,c(0,0.1,0.2,0.3,0.4,0.6,Inf)))
+
+dma_efficiency%>%count(under_v_bins)
+dma_efficiency%>%arrange(desc(potential_efficiency_gain))%>%select(dma_name,reported,potential_efficiency_gain)
+```
+#### median_removal_time vs. under_voted_prop
+```{r}
+dma_efficiency%>%filter(reported>300)%>%
+  ggplot(aes(x=under_voted_prop,y=median_time))+
+  geom_point()+
+  geom_smooth(method="lm")
+```
+
+#### Under-voting vs. number of reports
+```{r}
+dma_efficiency%>%
+  {boxplot(under_voted_prop~report_bins,data=.,names=c("0-200","200-500","500-1k","1k-5k","5k-10k","10k+"))}
+```
+
+
+## Overall Accuracy by reason
+
+Take the top 3 reported reason for each post.
+```{r}
+reasons_sep=reasons%>%select(content_id,report_reasons)%>%separate_rows(report_reasons,sep=",")%>%mutate(report_reasons=as.integer(report_reasons))
+
+reasons_cnt=reasons_sep%>%count(content_id,report_reasons)
+reasons_first_3=reasons_cnt%>%group_by(content_id)%>%arrange(desc(n))%>%slice(1:3)
+reasons_first_3=reasons_first_3%>%mutate(reason_num=c("reason1","reason2","reason3")[1:length(n)])%>%rename(reason_value=report_reasons)%>%left_join(reason_t%>%select(-3))
+
+reasons_first_3%>%ungroup%>%count(reason_num)
+1.5/24.15
+```
+About 6% reported for 2+ reasons.
+
+Category
+```{r}
+catg_top_3=reasons_cnt%>%rename(reason_value=report_reasons)%>%left_join(reason_t%>%select(reason_value,reason_category))%>%group_by(content_id,reason_category)%>%summarise(n=sum(n))%>%arrange(desc(n))%>%slice(1:3)
+catg_top_3=catg_top_3%>%mutate(reason_num=c("cat1","cat2","cat3")[1:length(n)])
+catg_top_3%>%ungroup()%>%count(reason_num)
+```
+About 4.5% reported for 2+ categories.
+
+```{r}
+catg_wide=catg_top_3%>%select(-n)%>%pivot_wider(names_from=reason_num,values_from = reason_category)
+reasons=reasons%>%left_join(catg_wide)%>%rename(reason1=cat1,reason2=cat2,reason3=cat3)%>%filter(!is.na(reason1))
+
+reasons_long=reasons%>%pivot_longer(reason1:reason3,names_to = "reason_num",values_to="reason")%>%filter(!is.na(reason))
+reasons_long
+
+
+```
+Removal Rate by Reason
+```{r}
+reasons_freq=reasons_long%>%count(reason)%>%mutate(prop=100*(n/sum(n))%>%round(3))
+top5_reason=reasons_freq%>%arrange(desc(n))%>%slice(1:7)%>%select(reason)
+
+result_by_reason=reasons_long%>%count(reason,result)%>%group_by(reason)%>%mutate(prop=100*(n/sum(n))%>%round(3))
+
+result_by_reason_sufficient=result_by_reason%>%filter(result%in%c("REMOVAL","KEEP"))%>%mutate(prop=100*(n/sum(n))%>%round(3))
+result_by_reason_sufficient%>%filter(result=="REMOVAL")%>%arrange(desc(n))
+
+result_by_reason
+
+result_by_reason_sufficient
+```
+
+
+removal votes by reason
+```{r}
+votes_by_reason=reasons_long%>%
+  filter(result=="REMOVAL")%>%
+  group_by(reason)%>%
+  summarise(mean_votes=mean(review_cnt),
+            median_votes=median(review_cnt),
+            votes_75=quantile(review_cnt,0.75),
+            votes_90=quantile(review_cnt,0.9))
+votes_by_reason
+```
+
+### dma Accuracy
+```{r}
+removal_rate_by_reason_by_dma=reasons_long%>%count(dma_name,reason,result)%>%
+  filter(result%in%c("REMOVAL","KEEP"),reason%in%unlist(top5_reason))%>%
+  group_by(dma_name,reason)%>%
+  mutate(prop=100*(n/sum(n))%>%round(3))%>%
+  left_join(dma_efficiency%>%
+              select(dma_name,reported,under_voted_prop,under_v_bins))%>%
+  arrange(desc(reported))%>%
+  filter(result=="REMOVAL")
+
+dma_accuracy_gain=removal_rate_by_reason_by_dma%>%
+  left_join(result_by_reason_sufficient%>%
+              select(reason,result,ref_prop=prop))%>%
+  mutate(deviation=prop-ref_prop)%>%
+  mutate(potential_efficiency_gain=(deviation/100*(n/(prop/100)))%>%round(1))
+dma_accuracy_gain
+```
+
+```{r}
+dma_accuracy_gain%>%filter(reason=="Offensive",reported>500)%>%
+  {hist(.$deviation,breaks=20,main="Histogram of dma offensive deviation")}
+```
+
+```{r}
+dma_accuracy_gain%>%filter(reason=="Offensive",reported>500)%>%
+  ggplot(aes(x=under_voted_prop,y=abs(deviation)))+
+  geom_point()+
+  geom_smooth(method="lm")
+  
+```
+
+```{r}
+dma_accuracy_gain%>%filter(reason=="Offensive",reported>500)%>%
+  {boxplot(abs(deviation)~under_v_bins,data=.)}
+
+```
+
+
+```{r}
+dma_accuracy_gain_agg=dma_accuracy_gain%>%group_by(dma_name)%>%summarise(potential_efficiency_gain=sum(abs(potential_efficiency_gain)))%>%arrange(desc(potential_efficiency_gain))
+dma_accuracy_gain_agg
+```
+
+
+
+
+## By city
+### City Efficiency 
+```{r city Removal Time Table}
+city_time=reasons%>%
+  filter(result=="REMOVAL",process_time<24*30)%>%
+  group_by(state,city)%>%
+  summarise(average_time=mean(process_time,na.rm=T),
+  median_time=median(process_time,na.rm=T),
+  perc_75=quantile(process_time,.75,na.rm=T),
+  perc_90=quantile(process_time,.90,na.rm=T))
+
+city_result=reasons%>%
+  group_by(state,city)%>%
+  count(result)%>%
+  pivot_wider(names_from=result,values_from = n)
+
+city_efficiency=reasons%>%
+  count(state,city)%>%
+  arrange(desc(n))%>%
+  rename(reported=n)%>%
+  left_join(city_result)%>%
+  left_join(city_time)%>%
+  mutate(under_voted_prop=NO_DECISION_4_OR_LESS/reported,
+         potential_efficiency_gain=NO_DECISION_4_OR_LESS*0.7)%>%
+  mutate(report_bins=cut(reported,c(0,200,500,1000,5000,10000,Inf)),
+         under_v_bins=cut(under_voted_prop,c(0,0.1,0.2,0.3,0.4,0.6,Inf)))
+
+city_efficiency%>%count(under_v_bins)
+city_efficiency%>%arrange(desc(potential_efficiency_gain))%>%select(state,city,reported,potential_efficiency_gain)
+```
+
+
+```{r}
+city_efficiency%>%filter(reported>500)%>%
+  ggplot(aes(x=under_voted_prop,y=median_time))+
+  geom_point()+
+  geom_smooth(method="lm")
+```
+```{r}
+
+city_efficiency%>%filter(reported>500)%>%
+  ggplot(aes(x=under_voted_prop,y=perc_75))+
+  geom_point()+
+  geom_smooth(method="lm")
+```
+
+
+
+
+```{r}
+city_efficiency%>%
+  {boxplot(under_voted_prop~report_bins,data=.,names=c("0-200","200-500","500-1k","1k-5k","5k-10k","10k+"))}
+```
+
+
+```{r}
+
+city_accuracy=city_efficiency%>%filter(REMOVAL>100)%>%mutate(removal_rate=REMOVAL/(REMOVAL+KEEP))
+
+city_accuracy%>%{hist(.$removal_rate,breaks=20)}
+```
+
+
+### City Accuracy
+```{r}
+removal_rate_by_reason_by_city=reasons_long%>%count(state,city,reason,result)%>%
+  filter(result%in%c("REMOVAL","KEEP"),reason%in%unlist(top5_reason))%>%
+  group_by(state,city,reason)%>%
+  mutate(prop=100*(n/sum(n))%>%round(3))%>%
+  left_join(city_efficiency%>%
+              select(state,city,reported,under_voted_prop,under_v_bins))%>%
+  arrange(desc(reported))%>%
+  filter(result=="REMOVAL")
+
+city_accuracy_gain=removal_rate_by_reason_by_city%>%
+  left_join(result_by_reason_sufficient%>%
+              select(reason,result,ref_prop=prop))%>%
+  mutate(deviation=prop-ref_prop)%>%
+  mutate(potential_efficiency_gain=(deviation/100*(n/(prop/100)))%>%round(1))
+```
+
+```{r}
+city_accuracy_gain%>%filter(reason=="Offensive",reported>500)%>%
+  {hist(.$deviation,breaks=20,main="Histogram of city offensive deviation")}
+```
+
+```{r}
+city_accuracy_gain%>%filter(reason=="Offensive",reported>500)%>%
+  ggplot(aes(x=under_voted_prop,y=abs(deviation)))+
+  geom_point()+
+  geom_smooth(method="lm")
+```
+
+```{r}
+city_accuracy_gain%>%filter(reason=="Offensive",reported>200)%>%
+  {boxplot(abs(deviation)~under_v_bins,data=.)}
+```
+
+
+```{r}
+city_accuracy_gain_agg=city_accuracy_gain%>%
+  group_by(state,city)%>%
+  summarise(potential_efficiency_gain=sum(abs(potential_efficiency_gain)))%>%
+  arrange(desc(potential_efficiency_gain))
+city_accuracy_gain_agg
+
+city_accuracy_gain%>%
+  select(-c(result,reported,state,under_voted_prop,under_v_bins))%>%
+  rename(removal=n,removal_rate=prop,ref_removal_rate=ref_prop)
+```
